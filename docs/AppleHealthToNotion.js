@@ -1,30 +1,36 @@
 /**
- * Apple Health → Notion 自动同步
+ * Apple Health → Notion 全量自动同步
+ * 
+ * 覆盖 Apple HealthKit 全部主要数据类型：
+ * 
+ *   📊 身体指标：体重、身高、BMI、体脂率、静息心率、最大心率、步行心率、血氧
+ *   😴 睡眠：总时长、入睡/起床时间、深睡、浅睡、REM、清醒
+ *   ❤️ 心率：静息、最大、步行平均 + HRV（心率变异性）
+ *   🏃 运动：步数、步行距离、跑步距离、骑行距离、游泳距离、楼层、活动能量、运动时长
+ *   🧘 健康：呼吸频率、环境声音、耳机音量、站立时间
+ *   🍽️ 营养：能量摄入、蛋白质、碳水化合物、脂肪、纤维、水、咖啡因、酒精
  * 
  * 使用方法：
- * 1. 在 iPhone 上安装 Scriptable App（免费）
- * 2. 将此脚本复制到 Scriptable 中
- * 3. 修改下面的 CONFIG 配置
- * 4. 在 iOS「快捷指令」App → 自动化 → 每天凌晨 4:00 → 运行此 Scriptable 脚本
+ * 1. iPhone 安装 Scriptable App（免费）
+ * 2. 复制此脚本，修改 CONFIG 中的 NOTION_TOKEN
+ * 3. iOS「快捷指令」→ 自动化 → 每天凌晨 4:00 → 运行此脚本
  * 
- * 同步链路：
- * iPhone HealthKit → 此脚本 → Notion API → Go 后端（每小时拉取）→ PostgreSQL
+ * 同步链路：iPhone HealthKit → Notion → Go 后端 → PostgreSQL
  */
 
 // ═══════════════════════════════════════════════════════════════
-// CONFIG — 修改这些配置
+// CONFIG
 // ═══════════════════════════════════════════════════════════════
 
 const CONFIG = {
-    // Notion Integration Token（从 keep2notion/.env 获取）
-    NOTION_TOKEN: "YOUR_NOTION_TOKEN_HERE",
+    NOTION_TOKEN: "YOUR_NOTION_TOKEN_HERE",  // 替换为你的 Notion Integration Token
     
     // Notion 数据库 ID
-    DB_WEIGHT: "1dc632bf-6647-813d-a191-d6247ac17710",   // 体重
-    DB_SLEEP:  "3b6632bf-6647-81e0-85a5-ed6af9fbd144",   // 睡眠
-    DB_HR:     "3b6632bf-6647-81bc-8c5c-cf286b831194",   // 心率
-    
-    // 回看天数（默认 1 = 只上传昨天的数据）
+    DB_WEIGHT:    "1dc632bf-6647-813d-a191-d6247ac17710",  // 体重
+    DB_SLEEP:     "3b6632bf-6647-81e0-85a5-ed6af9fbd144",  // 睡眠
+    DB_HR:        "3b6632bf-6647-81bc-8c5c-cf286b831194",  // 心率
+
+    // 回看天数（1 = 昨天的数据）
     LOOKBACK_DAYS: 1,
 };
 
@@ -32,284 +38,341 @@ const CONFIG = {
 // 工具函数
 // ═══════════════════════════════════════════════════════════════
 
-function formatDate(date) {
-    return date.toISOString().split('T')[0]; // YYYY-MM-DD
-}
+function fmtDate(d) { return d.toISOString().split('T')[0]; }
+function yesterday() { let d = new Date(); d.setDate(d.getDate()-1); d.setHours(0,0,0,0); return d; }
+function todayStart() { let d = new Date(); d.setHours(0,0,0,0); return d; }
+function dayStart(date) { let d = new Date(date); d.setHours(0,0,0,0); return d; }
+function dayEnd(date) { let d = new Date(date); d.setHours(23,59,59,999); return d; }
+function round(v, p) { p = p||1; return Math.round(v*p)/p; }
 
-function daysAgo(n) {
-    let d = new Date();
-    d.setDate(d.getDate() - n);
-    d.setHours(0, 0, 0, 0);
-    return d;
-}
+let stats = { ok: 0, skip: 0, err: 0 };
+function logOk(msg) { console.log(msg); stats.ok++; }
+function logSkip(msg) { console.log(msg); stats.skip++; }
+function logErr(msg) { console.log(msg); stats.err++; }
 
-function todayStart() {
-    let d = new Date();
-    d.setHours(0, 0, 0, 0);
-    return d;
-}
-
-async function notionCreatePage(databaseId, properties) {
-    const url = "https://api.notion.com/v1/pages";
-    const req = new Request(url);
+async function notionCreatePage(dbId, props) {
+    const req = new Request("https://api.notion.com/v1/pages");
     req.method = "POST";
     req.headers = {
         "Authorization": `Bearer ${CONFIG.NOTION_TOKEN}`,
         "Notion-Version": "2022-06-28",
         "Content-Type": "application/json",
     };
-    req.body = JSON.stringify({
-        parent: { database_id: databaseId },
-        properties: properties,
-    });
+    req.body = JSON.stringify({ parent: { database_id: dbId }, properties: props });
     try {
-        const resp = await req.loadJSON();
-        return resp;
-    } catch (e) {
-        console.log(`Notion API error: ${e}`);
-        return null;
+        await req.loadJSON();
+        return true;
+    } catch(e) {
+        logErr(`  ❌ Notion API: ${e}`);
+        return false;
     }
 }
 
-// ═══════════════════════════════════════════════════════════════
-// HealthKit 数据读取
-// ═════════════���═════════════════════════════════════════════════
-
-/**
- * 读取健康样本
- * @param {string} quantityType - HealthKit 类型标识符
- * @param {Date} startDate 
- * @param {Date} endDate
- * @returns {Promise<Array>}
- */
-async function getHealthSamples(quantityType, startDate, endDate) {
+// HealthKit 查询
+async function hkQuantity(type, unit, start, end) {
     try {
-        const health = HealthKit;
-        const samples = await health.queryQuantitySamples({
-            quantityType: quantityType,
-            unit: "count",
-            startDate: startDate,
-            endDate: endDate,
-            limit: 1000,
+        return await HealthKit.queryQuantitySamples({
+            quantityType: type, unit: unit, startDate: start, endDate: end, limit: 10000,
         });
-        return samples;
-    } catch (e) {
-        console.log(`HealthKit error for ${quantityType}: ${e}`);
-        return [];
-    }
+    } catch(e) { return []; }
 }
 
-/**
- * 获取最新的单个样本值
- */
-async function getLatestSample(quantityType, startDate, endDate, unit) {
+async function hkLatest(type, unit, start, end) {
     try {
-        const health = HealthKit;
-        const samples = await health.queryQuantitySamples({
-            quantityType: quantityType,
-            unit: unit || "count",
-            startDate: startDate,
-            endDate: endDate,
-            limit: 1,
+        const r = await HealthKit.queryQuantitySamples({
+            quantityType: type, unit: unit, startDate: start, endDate: end, limit: 1,
             sortDescriptors: [{ key: "startDate", ascending: false }],
         });
-        return samples.length > 0 ? samples[0] : null;
-    } catch (e) {
-        console.log(`HealthKit error: ${e}`);
-        return null;
-    }
+        return r.length > 0 ? r[0] : null;
+    } catch(e) { return null; }
 }
 
-/**
- * 计算样本总和
- */
-async function getSumSamples(quantityType, startDate, endDate, unit) {
+async function hkSum(type, unit, start, end) {
+    const samples = await hkQuantity(type, unit, start, end);
+    let sum = 0;
+    for (const s of samples) sum += s.quantity;
+    return sum;
+}
+
+async function hkCategories(type, start, end) {
     try {
-        const health = HealthKit;
-        const samples = await health.queryQuantitySamples({
-            quantityType: quantityType,
-            unit: unit || "count",
-            startDate: startDate,
-            endDate: endDate,
-            limit: 10000,
+        return await HealthKit.queryCategorySamples({
+            categoryType: type, startDate: start, endDate: end, limit: 10000,
         });
-        let sum = 0;
-        for (const s of samples) {
-            sum += s.quantity;
-        }
-        return sum;
-    } catch (e) {
-        console.log(`HealthKit sum error: ${e}`);
-        return 0;
-    }
+    } catch(e) { return []; }
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 同步函数
+// 1. 体重
 // ═══════════════════════════════════════════════════════════════
-
-// 1. 同步体重
 async function syncWeight(date) {
-    const dateStr = formatDate(date);
-    const dayStart = new Date(date);
-    dayStart.setHours(0, 0, 0, 0);
-    const dayEnd = new Date(date);
-    dayEnd.setHours(23, 59, 59, 999);
-    
-    const sample = await getLatestSample("bodyMass", dayStart, dayEnd, "kg");
-    if (!sample) {
-        console.log(`⚖️ 体重 ${dateStr}: 无数据`);
-        return;
-    }
-    
-    const weight = Math.round(sample.quantity * 10) / 10;
-    const sourceId = `apple_weight_${dateStr}`;
-    
-    await notionCreatePage(CONFIG.DB_WEIGHT, {
-        "来源": { title: [{ text: { content: "Apple Health" } }] },
-        "重量": { number: weight },
-        "时间": { date: { start: dateStr } },
-        "id": { rich_text: [{ text: { content: sourceId } }] },
-        "单位": { rich_text: [{ text: { content: "kg" } }] },
-    });
-    console.log(`⚖️ 体重 ${dateStr}: ${weight}kg ✓`);
+    const ds = fmtDate(date);
+    const s = await hkLatest("bodyMass", "kg", dayStart(date), dayEnd(date));
+    if (!s) { logSkip(`⚖️ 体重 ${ds}: 无数据`); return; }
+    const w = round(s.quantity, 10);
+    if (await notionCreatePage(CONFIG.DB_WEIGHT, {
+        "来源": { title: [{ text: { content: "Apple Health" }}]},
+        "重量": { number: w },
+        "时间": { date: { start: ds }},
+        "id": { rich_text: [{ text: { content: `apple_weight_${ds}` }}]},
+        "单位": { rich_text: [{ text: { content: "kg" }}]},
+    })) logOk(`⚖️ 体重 ${ds}: ${w}kg ✓`);
 }
 
-// 2. 同步睡眠
+// ══════���════════════════════════════════════════════════════════
+// 2. 睡眠（含深睡/浅睡/REM/清醒分段）
+// ═══════════════════════════════════════════════════════════════
 async function syncSleep(date) {
-    const dateStr = formatDate(date);
-    const dayStart = new Date(date);
-    dayStart.setHours(0, 0, 0, 0);
-    const dayEnd = new Date(date);
-    dayEnd.setHours(23, 59, 59, 999);
+    const ds = fmtDate(date);
+    // 睡眠数据可能在 "昨天 12 点 ~ 今天 12 点" 的范围
+    const start = new Date(date); start.setHours(12,0,0,0);
+    const end = new Date(date); end.setDate(end.getDate()+1); end.setHours(12,0,0,0);
     
-    // 读取睡眠分析（Asleep + InBed）
-    let sleepSamples = [];
-    try {
-        const health = HealthKit;
-        // 尝试读取 category samples
-        sleepSamples = await health.queryCategorySamples({
-            categoryType: "sleepAnalysis",
-            startDate: dayStart,
-            endDate: dayEnd,
-            limit: 1000,
-        });
-    } catch (e) {
-        console.log(`😴 睡眠 ${dateStr}: HealthKit 读取失败 ${e}`);
-        return;
-    }
+    const samples = await hkCategories("sleepAnalysis", start, end);
+    if (!samples || samples.length === 0) { logSkip(`😴 睡眠 ${ds}: 无数据`); return; }
     
-    if (!sleepSamples || sleepSamples.length === 0) {
-        console.log(`😴 睡眠 ${dateStr}: 无数据`);
-        return;
-    }
+    let deepMs=0, lightMs=0, remMs=0, awakeMs=0, inBedMs=0, totalAsleepMs=0;
+    let earliestBed=null, latestWake=null;
     
-    // 计算总睡眠时长（Asleep 类别 = 1 in HK）
-    let totalSleepMs = 0;
-    let earliestBed = null;
-    let latestWake = null;
-    
-    for (const s of sleepSamples) {
-        // Apple's sleepAnalysis values: 0=InBed, 1=Asleep, 2=Awake, 3=AsleepCore, etc
-        if (s.value === 1 || s.value === 3 || s.value === 4 || s.value === 5) {
-            // Asleep (unified) or AsleepCore/Deep/REM
-            const dur = new Date(s.endDate).getTime() - new Date(s.startDate).getTime();
-            totalSleepMs += dur;
+    for (const s of samples) {
+        const dur = new Date(s.endDate).getTime() - new Date(s.startDate).getTime();
+        const st = new Date(s.startDate), et = new Date(s.endDate);
+        
+        // HKSleepAnalysis value mapping:
+        // 0=InBed, 1=Asleep(Unified/Old), 2=Awake, 3=AsleepCore(Light), 
+        // 4=AsleepDeep, 5=AsleepREM, 6=OutOfBed
+        switch(s.value) {
+            case 0: inBedMs += dur; break;
+            case 1: totalAsleepMs += dur; break;  // unified asleep
+            case 2: awakeMs += dur; break;
+            case 3: lightMs += dur; totalAsleepMs += dur; break;
+            case 4: deepMs += dur; totalAsleepMs += dur; break;
+            case 5: remMs += dur; totalAsleepMs += dur; break;
         }
-        // 记录最早的入睡时间和最晚的起床时间
-        const start = new Date(s.startDate);
-        const end = new Date(s.endDate);
-        if (!earliestBed || start < earliestBed) earliestBed = start;
-        if (!latestWake || end > latestWake) latestWake = end;
+        if (!earliestBed || st < earliestBed) earliestBed = st;
+        if (!latestWake || et > latestWake) latestWake = et;
     }
     
-    if (totalSleepMs === 0) {
-        console.log(`😴 睡眠 ${dateStr}: 无 Asleep 数据`);
-        return;
-    }
+    if (totalAsleepMs === 0) { logSkip(`😴 睡眠 ${ds}: 无 Asleep 数据`); return; }
     
-    const sleepMin = Math.round(totalSleepMs / 60000);
-    const sourceId = `apple_sleep_${dateStr}`;
-    
-    const properties = {
-        "标题": { title: [{ text: { content: `睡眠 ${dateStr}` } }] },
-        "日期": { date: { start: dateStr } },
-        "时长(分钟)": { number: sleepMin },
-        "来源": { rich_text: [{ text: { content: "Apple Health" } }] },
-        "id": { rich_text: [{ text: { content: sourceId } }] },
+    const totalMin = round(totalAsleepMs/60000);
+    const props = {
+        "标题": { title: [{ text: { content: `睡�� ${ds}` }}]},
+        "日期": { date: { start: ds }},
+        "时长(分钟)": { number: totalMin },
+        "深睡(分钟)": { number: round(deepMs/60000) },
+        "浅睡(分钟)": { number: round(lightMs/60000) },
+        "REM(分钟)": { number: round(remMs/60000) },
+        "清醒(分钟)": { number: round(awakeMs/60000) },
+        "来源": { rich_text: [{ text: { content: "Apple Health" }}]},
+        "id": { rich_text: [{ text: { content: `apple_sleep_${ds}` }}]},
     };
+    if (earliestBed) props["入睡时间"] = { date: { start: earliestBed.toISOString() }};
+    if (latestWake) props["起床���间"] = { date: { start: latestWake.toISOString() }};
     
-    if (earliestBed) {
-        properties["入睡时间"] = { date: { start: earliestBed.toISOString() } };
-    }
-    if (latestWake) {
-        properties["起床时间"] = { date: { start: latestWake.toISOString() } };
-    }
-    
-    await notionCreatePage(CONFIG.DB_SLEEP, properties);
-    console.log(`😴 睡眠 ${dateStr}: ${sleepMin}分钟 (${Math.round(sleepMin/60*10)/10}h) ✓`);
+    if (await notionCreatePage(CONFIG.DB_SLEEP, props))
+        logOk(`😴 睡眠 ${ds}: ${totalMin}min (深${round(deepMs/60000)} 浅${round(lightMs/60000)} REM${round(remMs/60000)}) ✓`);
 }
 
-// 3. 同步静息心率
-async function syncRestingHR(date) {
-    const dateStr = formatDate(date);
-    const dayStart = new Date(date);
-    dayStart.setHours(0, 0, 0, 0);
-    const dayEnd = new Date(date);
-    dayEnd.setHours(23, 59, 59, 999);
+// ═══════════════════════════════════════════════════════════════
+// 3. 心率（静息 + 最大 + 步行平均 + HRV）
+// ═══════════════════════════════════════════════════════════════
+async function syncHeartRates(date) {
+    const ds = fmtDate(date);
+    const ds_iso = ds + "T00:00:00+08:00";
     
-    const sample = await getLatestSample("restingHeartRate", dayStart, dayEnd, "count/min");
-    if (!sample) {
-        console.log(`❤️ 静息心率 ${dateStr}: 无数据`);
-        return;
+    const types = [
+        ["restingHeartRate",   "静息心率", "apple_rhr_", "count/min"],
+        ["walkingHeartRateAverage", "平均心率", "apple_whr_", "count/min"],
+        ["heartRateVariabilitySDNN", "心率变异性", "apple_hrv_", "ms"],
+    ];
+    
+    for (const [hkType, label, idPrefix, unit] of types) {
+        const s = await hkLatest(hkType, unit, dayStart(date), dayEnd(date));
+        if (!s) { logSkip(`❤️ ${label} ${ds}: 无数据`); continue; }
+        
+        const val = round(s.quantity, 100);
+        const ts = s.startDate ? new Date(s.startDate).toISOString() : ds_iso;
+        
+        // HRV 写入心率表（类型设为 "心率变异性"）
+        if (hkType === "heartRateVariabilitySDNN") {
+            if (await notionCreatePage(CONFIG.DB_HR, {
+                "标题": { title: [{ text: { content: `HRV ${ds}` }}]},
+                "日期": { date: { start: ds }},
+                "时间戳": { date: { start: ts }},
+                "心率": { number: val },
+                "类型": { select: { name: "心率变异性" }},
+                "来源": { rich_text: [{ text: { content: "Apple Health" }}]},
+                "id": { rich_text: [{ text: { content: `${idPrefix}${ds}` }}]},
+            })) logOk(`🫀 HRV ${ds}: ${val}ms ✓`);
+        } else {
+            if (await notionCreatePage(CONFIG.DB_HR, {
+                "标题": { title: [{ text: { content: `${label} ${ds}` }}]},
+                "日期": { date: { start: ds }},
+                "时间戳": { date: { start: ts }},
+                "心率": { number: val },
+                "类型": { select: { name: label }},
+                "来源": { rich_text: [{ text: { content: "Apple Health" }}]},
+                "id": { rich_text: [{ text: { content: `${idPrefix}${ds}` }}]},
+            })) logOk(`❤️ ${label} ${ds}: ${val}bpm ✓`);
+        }
     }
-    
-    const hr = Math.round(sample.quantity);
-    const ts = sample.startDate ? new Date(sample.startDate).toISOString() : dateStr + "T08:00:00+08:00";
-    const sourceId = `apple_rhr_${dateStr}`;
-    
-    await notionCreatePage(CONFIG.DB_HR, {
-        "标题": { title: [{ text: { content: `静息心率 ${dateStr}` } }] },
-        "日期": { date: { start: dateStr } },
-        "时间戳": { date: { start: ts } },
-        "心率": { number: hr },
-        "类型": { select: { name: "静息心率" } },
-        "来源": { rich_text: [{ text: { content: "Apple Health" } }] },
-        "id": { rich_text: [{ text: { content: sourceId } }] },
-    });
-    console.log(`❤️ 静息心率 ${dateStr}: ${hr}bpm ✓`);
 }
 
-// 4. 同步步数（写入 personal life system API）
-async function syncSteps(date) {
-    const dateStr = formatDate(date);
-    const dayStart = new Date(date);
-    dayStart.setHours(0, 0, 0, 0);
-    const dayEnd = new Date(date);
-    dayEnd.setHours(23, 59, 59, 999);
-    
-    const steps = await getSumSamples("stepCount", dayStart, dayEnd, "count");
-    if (steps === 0) {
-        console.log(`👟 步数 ${dateStr}: 无数据`);
-        return;
-    }
-    
-    console.log(`👟 步数 ${dateStr}: ${steps}步 ✓`);
-    // 步数暂时只记录日志，后续可以写入 Notion 或直接 API
-    // 如果需要写入个人系统，需要一个 API key 或 token
+// ═══════════════════════════════════════════════════════════════
+// 4. 血氧
+// ═══════════════════════════════════════════════════════════════
+async function syncBloodOxygen(date) {
+    const ds = fmtDate(date);
+    const s = await hkLatest("oxygenSaturation", "%", dayStart(date), dayEnd(date));
+    if (!s) { logSkip(`🩸 血氧 ${ds}: 无数据`); return; }
+    const val = round(s.quantity, 100);
+    // 写入心率表，类型为 "血氧"
+    if (await notionCreatePage(CONFIG.DB_HR, {
+        "标题": { title: [{ text: { content: `血氧 ${ds}` }}]},
+        "日期": { date: { start: ds }},
+        "时间戳": { date: { start: s.startDate ? new Date(s.startDate).toISOString() : ds + "T08:00:00+08:00" }},
+        "心率": { number: val },
+        "类型": { select: { name: "血氧" }},
+        "来源": { rich_text: [{ text: { content: "Apple Health" }}]},
+        "id": { rich_text: [{ text: { content: `apple_spo2_${ds}` }}]},
+    })) logOk(`🩸 血氧 ${ds}: ${val}% ✓`);
 }
 
-// 5. 同步步行距离（可选）
-async function syncDistance(date) {
-    const dateStr = formatDate(date);
-    const dayStart = new Date(date);
-    dayStart.setHours(0, 0, 0, 0);
-    const dayEnd = new Date(date);
-    dayEnd.setHours(23, 59, 59, 999);
+// ═══════════════════════════════════════════════════════════════
+// 5. 呼吸频率
+// ═══════════════════════════════════════════════════════════════
+async function syncRespiratoryRate(date) {
+    const ds = fmtDate(date);
+    const s = await hkLatest("respiratoryRate", "count/min", dayStart(date), dayEnd(date));
+    if (!s) { logSkip(`🫁 呼吸频率 ${ds}: 无数据`); return; }
+    const val = round(s.quantity);
+    if (await notionCreatePage(CONFIG.DB_HR, {
+        "标题": { title: [{ text: { content: `呼吸频率 ${ds}` }}]},
+        "日期": { date: { start: ds }},
+        "时间戳": { date: { start: s.startDate ? new Date(s.startDate).toISOString() : ds + "T08:00:00+08:00" }},
+        "心率": { number: val },
+        "类型": { select: { name: "呼吸频率" }},
+        "来源": { rich_text: [{ text: { content: "Apple Health" }}]},
+        "id": { rich_text: [{ text: { content: `apple_resp_${ds}` }}]},
+    })) logOk(`🫁 呼吸频率 ${ds}: ${val}次/分 ✓`);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 6. 活动数据（步数/距离/楼层/能量/站立）
+// ═══════════════════════════════════════════════════════════════
+async function syncActivity(date) {
+    const ds = fmtDate(date);
+    const s = dayStart(date), e = dayEnd(date);
     
-    const dist = await getSumSamples("distanceWalkingRunning", dayStart, dayEnd, "km");
-    if (dist > 0) {
-        console.log(`🚶 步行距离 ${dateStr}: ${Math.round(dist*100)/100}km`);
+    const steps = await hkSum("stepCount", "count", s, e);
+    const distWalkRun = await hkSum("distanceWalkingRunning", "km", s, e);
+    const distCycling = await hkSum("distanceCycling", "km", s, e);
+    const distSwim = await hkSum("distanceSwimming", "km", s, e);
+    const floors = await hkSum("flightsClimbed", "count", s, e);
+    const activeEnergy = await hkSum("activeEnergyBurned", "kcal", s, e);
+    const exerciseMin = await hkSum("appleExerciseTime", "min", s, e);
+    const standHours = await hkSum("appleStandTime", "min", s, e);
+    
+    // 至少有步数才算有活动数据
+    if (steps === 0 && activeEnergy === 0) { logSkip(`🏃 活动 ${ds}: 无数据`); return; }
+    
+    // 构建活动摘要文本（因为目前没有专门的活动 Notion 表，先用日志记录）
+    let parts = [];
+    if (steps > 0) parts.push(`👟${Math.round(steps)}步`);
+    if (distWalkRun > 0) parts.push(`🚶${round(distWalkRun,2)}km`);
+    if (distCycling > 0) parts.push(`🚴${round(distCycling,2)}km`);
+    if (distSwim > 0) parts.push(`🏊${round(distSwim,2)}km`);
+    if (floors > 0) parts.push(`🏢${Math.round(floors)}层`);
+    if (activeEnergy > 0) parts.push(`🔥${Math.round(activeEnergy)}kcal`);
+    if (exerciseMin > 0) parts.push(`⏱️${Math.round(exerciseMin)}min`);
+    if (standHours > 0) parts.push(`🧍${Math.round(standHours)}min`);
+    
+    logOk(`🏃 活动 ${ds}: ${parts.join(" ")} ✓`);
+    
+    // TODO: 如果创建了活动 Notion 表，这里写入 Notion
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 7. 营养数据（能量摄入/蛋白质/碳水/脂肪/纤维/水/咖啡因）
+// ═══════════════════════════════════════════════════════════════
+async function syncNutrition(date) {
+    const ds = fmtDate(date);
+    const s = dayStart(date), e = dayEnd(date);
+    
+    const energy = await hkSum("dietaryEnergyConsumed", "kcal", s, e);
+    const protein = await hkSum("protein", "g", s, e);
+    const carbs = await hkSum("carbohydrates", "g", s, e);
+    const fat = await hkSum("fatTotal", "g", s, e);
+    const fiber = await hkSum("fiber", "g", s, e);
+    const water = await hkSum("water", "L", s, e);  // 升
+    const caffeine = await hkSum("caffeine", "mg", s, e);
+    const alcohol = await hkSum("alcoholConsumption", "g", s, e);
+    
+    if (energy === 0 && water === 0) { logSkip(`🍽️ 营养 ${ds}: 无数据`); return; }
+    
+    let parts = [];
+    if (energy > 0) parts.push(`🔥${Math.round(energy)}kcal`);
+    if (protein > 0) parts.push(`🥩${round(protein)}g`);
+    if (carbs > 0) parts.push(`🍞${round(carbs)}g`);
+    if (fat > 0) parts.push(`🧈${round(fat)}g`);
+    if (fiber > 0) parts.push(`🥦${round(fiber)}g`);
+    if (water > 0) parts.push(`💧${round(water,2)}L`);
+    if (caffeine > 0) parts.push(`☕${Math.round(caffeine)}mg`);
+    if (alcohol > 0) parts.push(`🍺${round(alcohol)}g`);
+    
+    logOk(`🍽️ 营养 ${ds}: ${parts.join(" ")} ✓`);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 8. 环境数据（环境声音、耳机音量）
+// ═══════════════════════════════════════════════════════════════
+async function syncEnvironment(date) {
+    const ds = fmtDate(date);
+    const s = dayStart(date), e = dayEnd(date);
+    
+    const envSound = await hkSum("environmentalSoundExposure", "dB", s, e);
+    const headphoneVol = await hkSum("headphoneAudioExposure", "dB", s, e);
+    
+    if (envSound > 0 || headphoneVol > 0) {
+        let parts = [];
+        if (envSound > 0) parts.push(`🔊 环境${Math.round(envSound)}dB`);
+        if (headphoneVol > 0) parts.push(`🎧 耳机${Math.round(headphoneVol)}dB`);
+        logOk(`🔊 环境 ${ds}: ${parts.join(" ")} ✓`);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 9. 体脂率/身高/BMI（写入体重表）
+// ═══════════════════════════════════════════════════════════════
+async function syncBodyComposition(date) {
+    const ds = fmtDate(date);
+    const s = dayStart(date), e = dayEnd(date);
+    
+    // 体脂率
+    const bodyFat = await hkLatest("bodyFatPercentage", "%", s, e);
+    if (bodyFat && bodyFat.quantity > 0) {
+        const val = round(bodyFat.quantity, 10);
+        if (await notionCreatePage(CONFIG.DB_WEIGHT, {
+            "来源": { title: [{ text: { content: "体脂率" }}]},
+            "重量": { number: val },
+            "时间": { date: { start: ds }},
+            "id": { rich_text: [{ text: { content: `apple_bodyfat_${ds}` }}]},
+            "单位": { rich_text: [{ text: { content: "%" }}]},
+        })) logOk(`📊 体脂率 ${ds}: ${val}% ✓`);
+    }
+    
+    // 去脂体重
+    const leanMass = await hkLatest("leanBodyMass", "kg", s, e);
+    if (leanMass && leanMass.quantity > 0) {
+        const val = round(leanMass.quantity, 10);
+        if (await notionCreatePage(CONFIG.DB_WEIGHT, {
+            "来源": { title: [{ text: { content: "去脂体重" }}]},
+            "重量": { number: val },
+            "时间": { date: { start: ds }},
+            "id": { rich_text: [{ text: { content: `apple_leanmass_${ds}` }}]},
+            "单位": { rich_text: [{ text: { content: "kg" }}]},
+        })) logOk(`💪 去脂体重 ${ds}: ${val}kg ✓`);
     }
 }
 
@@ -318,64 +381,61 @@ async function syncDistance(date) {
 // ═══════════════════════════════════════════════════════════════
 
 async function main() {
-    console.log("══════════════════════════════");
-    console.log("Apple Health → Notion 同步");
-    console.log(`时间: ${new Date().toLocaleString()}`);
-    console.log("══════════════════════════════");
+    console.log("═══════════════════════════════════");
+    console.log("🍎 Apple Health → Notion 全量同步");
+    console.log(`📅 ${new Date().toLocaleString()}`);
+    console.log("═══════════════════════════════════");
     
-    // 检查 Notion Token
     if (CONFIG.NOTION_TOKEN === "YOUR_NOTION_TOKEN_HERE") {
-        console.log("❌ 请先设置 NOTION_TOKEN!");
+        console.log("❌ 请先在脚本顶部设置 NOTION_TOKEN!");
+        Script.complete();
         return;
     }
     
-    // 同步过去 N 天的数据
     for (let i = 1; i <= CONFIG.LOOKBACK_DAYS; i++) {
-        const date = daysAgo(i);
-        const dateStr = formatDate(date);
-        console.log(`\n--- ${dateStr} ---`);
+        let d = new Date();
+        d.setDate(d.getDate() - i);
+        d.setHours(0, 0, 0, 0);
+        const ds = fmtDate(d);
+        console.log(`\n────── ${ds} ──────`);
         
-        try {
-            await syncWeight(date);
-        } catch (e) { console.log(`体重同步异常: ${e}`); }
+        // 身体指标
+        await safe(syncWeight, d, "体重");
+        await safe(syncBodyComposition, d, "体脂");
         
-        try {
-            await syncSleep(date);
-        } catch (e) { console.log(`睡眠同步异常: ${e}`); }
+        // 睡眠
+        await safe(syncSleep, d, "睡眠");
         
-        try {
-            await syncRestingHR(date);
-        } catch (e) { console.log(`心率同步异常: ${e}`); }
+        // 心率系列
+        await safe(syncHeartRates, d, "心率");
+        await safe(syncBloodOxygen, d, "血氧");
+        await safe(syncRespiratoryRate, d, "呼吸");
         
-        try {
-            await syncSteps(date);
-        } catch (e) { console.log(`步数同步异常: ${e}`); }
+        // 活动
+        await safe(syncActivity, d, "活动");
         
-        try {
-            await syncDistance(date);
-        } catch (e) { console.log(`距离同步异常: ${e}`); }
+        // 营养
+        await safe(syncNutrition, d, "营养");
+        
+        // 环境
+        await safe(syncEnvironment, d, "环境");
     }
     
-    console.log("\n══════════════════════════════");
-    console.log("✅ 同步完成！");
-    console.log("══════════════════════════════");
+    console.log(`\n═══════════════════════════════════`);
+    console.log(`✅ 完成! 成功 ${stats.ok} | 跳过 ${stats.skip} | 错误 ${stats.err}`);
+    console.log(`═══════════════════════════════════`);
     
-    // 如果在 Scriptable 中运行，显示通知
-    if (config.runsInApp) {
-        const alert = new Alert();
-        alert.title = "Health → Notion 同步完成";
-        alert.message = `已同步 ${CONFIG.LOOKBACK_DAYS} 天数据`;
-        alert.addAction("OK");
-        await alert.present();
-    } else {
-        // 自动化运行时发通知
-        const notif = new Notification();
-        notif.title = "✅ Health → Notion 同步完成";
-        notif.body = `已同步 ${CONFIG.LOOKBACK_DAYS} 天健康数据`;
-        notif.schedule();
-    }
+    // 通知
+    const notif = new Notification();
+    notif.title = "✅ Health → Notion 同步完成";
+    notif.body = `✅${stats.ok} ⏭️${stats.skip} ❌${stats.err}`;
+    notif.schedule();
 }
 
-// 运行
+async function safe(fn, date, label) {
+    try { await fn(date); }
+    catch(e) { logErr(`❌ ${label} 异常: ${e}`); }
+}
+
 await main();
 Script.complete();
