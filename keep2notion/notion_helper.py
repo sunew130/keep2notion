@@ -39,6 +39,8 @@ class NotionHelper:
         "ALL_DATABASE_NAME": "全部",
         "WEIGHT_DATABASE_NAME": "体重",
         "EQUIPMENT_DATABASE_NAME": "我的装备",
+        "SLEEP_DATABASE_NAME": "睡眠",
+        "HEARTRATE_DATABASE_NAME": "心率",
     }
     database_id_dict = {}
     image_dict = {}
@@ -77,7 +79,13 @@ class NotionHelper:
         )     
         self.equipment_database_id = self.database_id_dict.get(
             self.database_name_dict.get("EQUIPMENT_DATABASE_NAME")
-        )      
+        )     
+        self.sleep_database_id = self.database_id_dict.get(
+            self.database_name_dict.get("SLEEP_DATABASE_NAME")
+        )
+        self.heartrate_database_id = self.database_id_dict.get(
+            self.database_name_dict.get("HEARTRATE_DATABASE_NAME")
+        )
         if self.day_database_id:
             self.write_database_id(self.day_database_id)
 

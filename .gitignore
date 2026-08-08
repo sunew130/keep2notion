@@ -1,2 +1,6 @@
 scripts/__pycache__/
+keep2notion/__pycache__/
 .env
+keep_data.db
+OUT_FOLDER/
+*.svg

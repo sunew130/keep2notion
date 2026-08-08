@@ -13,6 +13,9 @@ LOGIN_API = "https://api.gotokeep.com/v1.1/users/login"
 DATA_API = "https://api.gotokeep.com/pd/v3/stats/detail?dateUnit=all&type=all&lastDate={last_date}"
 LOG_API = "https://api.gotokeep.com/pd/v3/{type}log/{id}"
 WEIGHT = "https://api.gotokeep.com/feynman/v3/data-center/sub/body-data/detail?indicatorType=WEIGHT&pageSize=10"
+SLEEP_DETAIL = "https://api.gotokeep.com/feynman/v3/data-center/sub/sleep/detail?dateUnit={unit}&date={date}"
+SLEEP_OVERVIEW = "https://api.gotokeep.com/feynman/v3/data-center/sub/sleep/overview?date={date}"
+HR_DETAIL = "https://api.gotokeep.com/feynman/v3/data-center/sub/body-data/detail?indicatorType={indicator}&pageSize=100"
 
 keep_headers = {
     "User-Agent": "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:78.0) Gecko/20100101 Firefox/78.0",
@@ -291,6 +294,236 @@ def add_to_notion(workout, end_time, icon, cover):
     )
 notion_helper = NotionHelper()
 
+# ── 睡眠数据同步 ──
+
+def get_sleep_data():
+    """从 Keep API 拉取最近 7 天的睡眠数据"""
+    import datetime
+    results = []
+    today = datetime.date.today()
+    for i in range(7):
+        date = (today - datetime.timedelta(days=i)).strftime("%Y-%m-%d")
+        url = SLEEP_DETAIL.format(unit="day", date=date)
+        try:
+            response = requests.get(url, headers=keep_headers, timeout=15)
+            if response.ok:
+                data = response.json().get("data", {})
+                card_list = data.get("cardList", [])
+                if card_list:
+                    for card in card_list:
+                        card_type = card.get("type", "")
+                        card_data = card.get("data", {})
+                        # 提取睡眠记录
+                        record = card_data.get("sleepRecord") or card_data.get("record") or card_data
+                        if record and isinstance(record, dict):
+                            record["_date"] = date
+                            results.append(record)
+                            print(f"  睡眠 {date}: 找到记录")
+                else:
+                    # 也尝试 overview 接口
+                    pass
+            else:
+                print(f"  睡眠 {date}: HTTP {response.status_code}")
+        except Exception as e:
+            print(f"  睡眠 {date}: 异常 {e}")
+    return results
+
+
+def insert_sleep_data_to_notion(sleep_data):
+    """将睡眠数据写入 Notion 睡眠数据库"""
+    if not notion_helper.sleep_database_id:
+        print("  睡眠数据库未找到，跳过")
+        return
+
+    existing_ids = set()
+    notion_sleeps = notion_helper.query_all(
+        database_id=notion_helper.sleep_database_id)
+    for item in notion_sleeps:
+        props = item.get("properties", {})
+        if props.get("id"):
+            rt = props.get("id").get("rich_text")
+            if rt:
+                existing_ids.add(rt[0].get("plain_text"))
+
+    count = 0
+    for entry in sleep_data:
+        entry_id = entry.get("id") or entry.get("_date", "")
+        if entry_id in existing_ids:
+            continue
+
+        # 解析时间戳 (Keep 返回毫秒时间戳)
+        start_ts = entry.get("sleepStartTime") or entry.get("startTime") or entry.get("bedTime")
+        end_ts = entry.get("sleepEndTime") or entry.get("endTime") or entry.get("wakeTime")
+
+        properties = {}
+        date_str = entry.get("_date", "")
+
+        if start_ts and isinstance(start_ts, (int, float)) and start_ts > 1000000000:
+            start_dt = pendulum.from_timestamp(start_ts / 1000, tz="Asia/Shanghai")
+            properties["入睡时间"] = {"date": {"start": start_dt.to_iso8601_string()}}
+            if not date_str:
+                date_str = start_dt.format("YYYY-MM-DD")
+
+        if end_ts and isinstance(end_ts, (int, float)) and end_ts > 1000000000:
+            end_dt = pendulum.from_timestamp(end_ts / 1000, tz="Asia/Shanghai")
+            properties["起床时间"] = {"date": {"start": end_dt.to_iso8601_string()}}
+
+        if date_str:
+            properties["日期"] = {"date": {"start": date_str}}
+
+        # 时长（分钟）
+        duration = entry.get("sleepDuration") or entry.get("duration") or entry.get("totalDuration")
+        if duration:
+            if duration > 100000:  # 毫秒
+                duration = duration / 60000
+            properties["时长(分钟)"] = {"number": round(duration)}
+
+        # 深睡
+        deep = entry.get("deepSleepDuration") or entry.get("deepDuration")
+        if deep:
+            if deep > 100000:
+                deep = deep / 60000
+            properties["深睡(分钟)"] = {"number": round(deep)}
+
+        # 浅睡
+        light = entry.get("lightSleepDuration") or entry.get("shallowDuration") or entry.get("lightDuration")
+        if light:
+            if light > 100000:
+                light = light / 60000
+            properties["浅睡(分钟)"] = {"number": round(light)}
+
+        # REM
+        rem = entry.get("remDuration") or entry.get("remSleepDuration")
+        if rem:
+            if rem > 100000:
+                rem = rem / 60000
+            properties["REM(分钟)"] = {"number": round(rem)}
+
+        # 清醒
+        awake = entry.get("awakeDuration") or entry.get("wakeDuration")
+        if awake:
+            if awake > 100000:
+                awake = awake / 60000
+            properties["清醒(分钟)"] = {"number": round(awake)}
+
+        # 评分
+        score = entry.get("score") or entry.get("sleepScore")
+        if score:
+            properties["评分"] = {"number": score}
+
+        # 来源
+        source = entry.get("source", "")
+        if isinstance(source, dict):
+            source = source.get("displayName", "Keep")
+        properties["来源"] = {"rich_text": [{"text": {"content": source or "Keep"}}]}
+        properties["id"] = {"rich_text": [{"text": {"content": str(entry_id)}}]}
+        properties["标题"] = {"title": [{"text": {"content": f"睡眠 {date_str}"}}]}
+
+        try:
+            notion_helper.client.pages.create(
+                parent={"database_id": notion_helper.sleep_database_id},
+                properties=properties,
+            )
+            count += 1
+        except Exception as e:
+            print(f"  睡眠写入失败 {date_str}: {e}")
+
+    print(f"  睡眠: 新增 {count} 条")
+
+
+# ── 心率数据同步 ──
+
+def get_heart_rate_data():
+    """从 Keep API 拉取静息心率和最大心率"""
+    results = []
+    for indicator, hr_type in [("RESTING_HEART_RATE", "静息心率"), ("MAX_HEART_RATE", "最大心率")]:
+        url = HR_DETAIL.format(indicator=indicator)
+        next_page_token = None
+        while True:
+            full_url = url
+            if next_page_token:
+                full_url += f"&nextPageToken={next_page_token}"
+            try:
+                response = requests.get(full_url, headers=keep_headers, timeout=15)
+                if response.ok:
+                    data = response.json().get("data", {})
+                    items = data.get("list", [])
+                    for item in items:
+                        item["_hrType"] = hr_type
+                        results.append(item)
+                    if not data.get("hasNextPage"):
+                        break
+                    next_page_token = data.get("nextPageToken")
+                else:
+                    print(f"  心率 {indicator}: HTTP {response.status_code}")
+                    break
+            except Exception as e:
+                print(f"  心率 {indicator}: 异常 {e}")
+                break
+    return results
+
+
+def insert_hr_data_to_notion(hr_data):
+    """将心率数据写入 Notion 心率数据库"""
+    if not notion_helper.heartrate_database_id:
+        print("  心率数据库未找到，跳过")
+        return
+
+    existing_ids = set()
+    notion_hrs = notion_helper.query_all(
+        database_id=notion_helper.heartrate_database_id)
+    for item in notion_hrs:
+        props = item.get("properties", {})
+        if props.get("id"):
+            rt = props.get("id").get("rich_text")
+            if rt:
+                existing_ids.add(rt[0].get("plain_text"))
+
+    count = 0
+    for entry in hr_data:
+        entry_id = entry.get("id", "")
+        if entry_id in existing_ids:
+            continue
+
+        properties = {}
+        hr_type = entry.get("_hrType", "")
+
+        # 时间
+        time_info = entry.get("time", {})
+        sample_end = time_info.get("sampleEndTime") or time_info.get("endTime")
+        if sample_end and sample_end > 1000000000:
+            dt = pendulum.from_timestamp(sample_end / 1000, tz="Asia/Shanghai")
+            date_str = dt.format("YYYY-MM-DD")
+            properties["日期"] = {"date": {"start": date_str}}
+            properties["时间戳"] = {"date": {"start": dt.to_iso8601_string()}}
+        else:
+            continue
+
+        # 心率值
+        value = entry.get("value", 0)
+        if value:
+            properties["心率"] = {"number": value}
+
+        # 类型
+        if hr_type:
+            properties["类型"] = {"select": {"name": hr_type}}
+
+        properties["来源"] = {"rich_text": [{"text": {"content": "Keep"}}]}
+        properties["id"] = {"rich_text": [{"text": {"content": str(entry_id)}}]}
+        properties["标题"] = {"title": [{"text": {"content": f"{hr_type} {date_str}"}}]}
+
+        try:
+            notion_helper.client.pages.create(
+                parent={"database_id": notion_helper.heartrate_database_id},
+                properties=properties,
+            )
+            count += 1
+        except Exception as e:
+            print(f"  心率写入失败 {date_str}: {e}")
+
+    print(f"  心率: 新增 {count} 条")
+
+
 def main():
     s = get_lastest()
     token = login()
@@ -314,6 +547,20 @@ def main():
             if log.get("isDoubtful"):
                 continue
             get_run_data(log,equipment_dict)
+    # 同步睡眠数据
+    print("=== 同步睡眠数据 ===")
+    sleep_data = get_sleep_data()
+    if sleep_data:
+        insert_sleep_data_to_notion(sleep_data)
+    else:
+        print("  未获取到睡眠数据")
+    # 同步心率数据
+    print("=== 同步心率数据 ===")
+    hr_data = get_heart_rate_data()
+    if hr_data:
+        insert_hr_data_to_notion(hr_data)
+    else:
+        print("  未获取到心率数据")
 
 if __name__ == "__main__":
     main()
