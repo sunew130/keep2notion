@@ -3,7 +3,9 @@ name: keep sync
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 0 * * *"
+    # 北京时间 12:00 和 23:00 各跑一次（UTC 04:00 / 15:00）
+    # 中午同步上午运动，晚上同步全天运动
+    - cron: "0 4,15 * * *"
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
